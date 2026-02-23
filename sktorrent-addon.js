@@ -6,8 +6,11 @@ const cheerio = require("cheerio");
 const bencode = require("bncode");
 const crypto = require("crypto");
 
-const SKT_UID = process.env.SKT_UID || "";
-const SKT_PASS = process.env.SKT_PASS || "";
+require("dotenv").config();
+
+const TMDB_KEY = process.env.TMDB_KEY;
+const SKT_UID = process.env.SKT_UID;
+const SKT_PASS = process.env.SKT_PASS;
 
 const BASE_URL = "https://sktorrent.eu";
 const SEARCH_URL = `${BASE_URL}/torrent/torrents_v2.php`;
@@ -45,25 +48,108 @@ function isMultiSeason(title) {
     return /(S\d{2}E\d{2}-\d{2}|Complete|All Episodes|Season \d+(-\d+)?)/i.test(title);
 }
 
-async function getTitleFromIMDb(imdbId) {
-    try {
-        const res = await axios.get(`https://www.imdb.com/title/${imdbId}/`, {
-            headers: { "User-Agent": "Mozilla/5.0" }
-        });
-        const $ = cheerio.load(res.data);
-        const titleRaw = $('title').text().split(' - ')[0].trim();
-        const title = decode(titleRaw);
-        const ldJson = $('script[type="application/ld+json"]').html();
-        let originalTitle = title;
-        if (ldJson) {
-            const json = JSON.parse(ldJson);
-            if (json && json.name) originalTitle = decode(json.name.trim());
+function findEpisodeFileIndex(files, season, episode) {
+    if (!files || !files.length) return 0;
+
+    const s = String(season).padStart(2, '0');
+    const e = String(episode).padStart(2, '0');
+
+    const patterns = [
+        new RegExp(`S${s}E${e}`, "i"),
+        new RegExp(`${season}x${episode}`, "i"),
+        new RegExp(`${s}${e}`, "i")
+    ];
+
+    for (let i = 0; i < files.length; i++) {
+        const filename = files[i].path.join(" ");
+
+        for (const pattern of patterns) {
+            if (pattern.test(filename)) {
+                console.log(`[DEBUG] 🎯 Našiel som epizódu v súbore: ${filename}`);
+                return i;
+            }
         }
-        console.log(`[DEBUG] 🌝 Lokalizovaný názov: ${title}`);
-        console.log(`[DEBUG] 🇳️ Originálny názov: ${originalTitle}`);
+    }
+
+    console.log("[WARN] ⚠️ Epizóda nenájdená");
+    return -1;
+}
+
+async function getTitleFromIMDb(imdbId, type) {
+    try {
+        const res = await axios.get(
+            `https://v3-cinemeta.strem.io/meta/${type}/${imdbId}.json`
+        );
+
+        if (!res.data || !res.data.meta) {
+            console.log("[ERROR] Cinemeta nevrátila metadata");
+            return null;
+        }
+
+        const title = res.data.meta.name;
+        const originalTitle = res.data.meta.name;
+
+        console.log(`[DEBUG] 🌝 Cinemeta názov: ${title}`);
+
         return { title, originalTitle };
+
     } catch (err) {
-        console.error("[ERROR] IMDb scraping zlyhal:", err.message);
+        console.error("[ERROR] Cinemeta zlyhala:", err.message);
+        return null;
+    }
+}
+
+async function getTitleFromTMDB(imdbId, type) {
+    try {
+        const findRes = await axios.get(
+            `https://api.themoviedb.org/3/find/${imdbId}`,
+            {
+                params: {
+                    api_key: TMDB_KEY,
+                    external_source: "imdb_id"
+                }
+            }
+        );
+
+        const result =
+            type === "movie"
+                ? findRes.data.movie_results[0]
+                : findRes.data.tv_results[0];
+
+        if (!result) return null;
+
+        const tmdbId = result.id;
+
+        const detailRes = await axios.get(
+            `https://api.themoviedb.org/3/${type === "movie" ? "movie" : "tv"}/${tmdbId}`,
+            {
+                params: {
+                    api_key: TMDB_KEY,
+                    language: "cs-CZ"
+                }
+            }
+        );
+
+        const localizedTitle =
+            type === "movie"
+                ? detailRes.data.title
+                : detailRes.data.name;
+
+        const originalTitle =
+            type === "movie"
+                ? detailRes.data.original_title
+                : detailRes.data.original_name;
+
+        console.log(`[DEBUG] 🇨🇿 TMDB názov: ${localizedTitle}`);
+        console.log(`[DEBUG] 🌍 TMDB originál: ${originalTitle}`);
+
+        return {
+            title: localizedTitle || originalTitle,
+            originalTitle
+        };
+
+    } catch (err) {
+        console.log("[WARN] TMDB zlyhalo, fallback na Cinemeta");
         return null;
     }
 }
@@ -71,8 +157,18 @@ async function getTitleFromIMDb(imdbId) {
 async function searchTorrents(query) {
     console.log(`[INFO] 🔎 Hľadám '${query}' na SKTorrent...`);
     try {
-        const session = axios.create({ headers: { Cookie: `uid=${SKT_UID}; pass=${SKT_PASS}` } });
-        const res = await session.get(SEARCH_URL, { params: { search: query, category: 0 } });
+        const session = axios.create({
+    headers: {
+        "Cookie": `uid=${SKT_UID}; pass=${SKT_PASS}`,
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/120 Safari/537.36",
+        "Referer": "https://sktorrent.eu/",
+        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+        "Accept-Language": "sk-SK,sk;q=0.9,cs;q=0.8,en;q=0.7",
+        "Connection": "keep-alive"
+    },
+    withCredentials: true
+});
+        const res = await session.get(SEARCH_URL + `?search=${encodeURIComponent(query)}&category=0`);
         const $ = cheerio.load(res.data);
         const posters = $('a[href^="details.php"] img');
         const results = [];
@@ -107,26 +203,40 @@ async function searchTorrents(query) {
     }
 }
 
-async function getInfoHashFromTorrent(url) {
+async function getInfoHashFromTorrent(url, torrentId) {
     try {
-        const res = await axios.get(url, {
-            responseType: "arraybuffer",
+        const session = axios.create({
             headers: {
-                Cookie: `uid=${SKT_UID}; pass=${SKT_PASS}`,
-                Referer: BASE_URL
+                "Cookie": `uid=${SKT_UID}; pass=${SKT_PASS}`,
+                "User-Agent": "Mozilla/5.0",
+                "Referer": BASE_URL
             }
         });
+
+        // 1️⃣ otevři detail stránku (důležité!)
+        await session.get(`${BASE_URL}/torrent/details.php?id=${torrentId}`);
+
+        // 2️⃣ až pak stáhni torrent
+        const res = await session.get(url, {
+            responseType: "arraybuffer"
+        });
+
         const torrent = bencode.decode(res.data);
         const info = bencode.encode(torrent.info);
         const infoHash = crypto.createHash("sha1").update(info).digest("hex");
-        return infoHash;
+
+return {
+    infoHash,
+    files: torrent.info.files || []
+};
+
     } catch (err) {
         console.error("[ERROR] ⛔️ Chyba pri spracovaní .torrent:", err.message);
         return null;
     }
 }
 
-async function toStream(t) {
+async function toStream(t, season, episode) {
     if (isMultiSeason(t.name)) {
         console.log(`[DEBUG] ❌ Preskakujem multi-season balík: '${t.name}'`);
         return null;
@@ -141,15 +251,29 @@ async function toStream(t) {
         cleanedTitle = cleanedTitle.slice(t.category.length).trim();
     }
 
-    const infoHash = await getInfoHashFromTorrent(t.downloadUrl);
-    if (!infoHash) return null;
+    const torrentData = await getInfoHashFromTorrent(t.downloadUrl, t.id);
+    if (!torrentData) return null;
+    
+    const { infoHash, files } = torrentData;
+     
+    let fileIdx = 0;
+    
+    if (season && episode) {
+        fileIdx = findEpisodeFileIndex(files, season, episode);
 
-    return {
-        title: `${cleanedTitle}\n👤 ${t.seeds}  📀 ${t.size}  🩲 sktorrent.eu${flagsText}`,
-        name: `SKTorrent\n${t.category}`,
-        behaviorHints: { bingeGroup: cleanedTitle },
-        infoHash
-    };
+        if (fileIdx === -1) {
+            console.log("[DEBUG] ❌ Torrent neobsahuje požadovanú epizódu, preskakujem");
+            return null;
+        }
+    }
+
+ return {
+    title: `${cleanedTitle}\n👤 ${t.seeds}  📀 ${t.size}  🩲 sktorrent.eu${flagsText}`,
+    name: `SKTorrent\n${t.category}`,
+    behaviorHints: { bingeGroup: cleanedTitle },
+    infoHash,
+    fileIdx
+ };
 }
 
 builder.defineStreamHandler(async ({ type, id }) => {
@@ -161,8 +285,17 @@ builder.defineStreamHandler(async ({ type, id }) => {
 
     console.log(`====== 🎮 STREAM Požiadavka pre typ='${type}' imdbId='${imdbId}' season='${season}' episode='${episode}' ======`);
 
-    const titles = await getTitleFromIMDb(imdbId);
-    if (!titles) return { streams: [] };
+    let titles = null;
+
+if (TMDB_KEY) {
+    titles = await getTitleFromTMDB(imdbId, type);
+}
+
+if (!titles) {
+    titles = await getTitleFromIMDb(imdbId, type);
+}
+
+if (!titles) return { streams: [] };
 
     const { title, originalTitle } = titles;
     const queries = new Set();
@@ -174,10 +307,18 @@ builder.defineStreamHandler(async ({ type, id }) => {
 
         if (type === 'series' && season && episode) {
             const epTag = ` S${String(season).padStart(2, '0')}E${String(episode).padStart(2, '0')}`;
+            const seasonOnlyTag = ` ${season}. série`;
+            const seasonTagAlt = ` S${String(season).padStart(2, '0')}`;
             [base, noDia, short].forEach(b => {
                 queries.add(b + epTag);
                 queries.add((b + epTag).replace(/[\':]/g, ''));
                 queries.add((b + epTag).replace(/[\':]/g, '').replace(/\s+/g, '.'));
+                queries.add(base + seasonOnlyTag);
+                queries.add(base + seasonTagAlt);
+                queries.add(noDia + seasonOnlyTag);
+                queries.add(noDia + seasonTagAlt);
+                queries.add(`${base} ${season}-`);
+                queries.add(`${noDia} ${season}-`);
             });
         } else {
             [base, noDia, short].forEach(b => {
@@ -188,15 +329,30 @@ builder.defineStreamHandler(async ({ type, id }) => {
         }
     });
 
-    let torrents = [];
-    let attempt = 1;
-    for (const q of queries) {
-        console.log(`[DEBUG] 🔍 Pokus ${attempt++}: Hľadám '${q}'`);
-        torrents = await searchTorrents(q);
-        if (torrents.length > 0) break;
-    }
+    let allTorrents = [];
+let attempt = 1;
 
-    const streams = (await Promise.all(torrents.map(toStream))).filter(Boolean);
+for (const q of queries) {
+    console.log(`[DEBUG] 🔍 Pokus ${attempt++}: Hľadám '${q}'`);
+
+    const found = await searchTorrents(q);
+
+    if (found.length > 0) {
+        allTorrents.push(...found);
+    }
+}
+
+// odstranění duplicit podle ID
+const uniqueTorrents = Array.from(
+    new Map(allTorrents.map(t => [t.id, t])).values()
+);
+
+// seřazení podle počtu seedů (od nejvyšších)
+uniqueTorrents.sort((a, b) => Number(b.seeds) - Number(a.seeds));
+
+const streams = (await Promise.all(
+    uniqueTorrents.map(t => toStream(t, season, episode))
+)).filter(Boolean);
     console.log(`[INFO] ✅ Odosielam ${streams.length} streamov do Stremio`);
     return { streams };
 });
