@@ -309,6 +309,7 @@ if (!titles) return { streams: [] };
             const epTag = ` S${String(season).padStart(2, '0')}E${String(episode).padStart(2, '0')}`;
             const seasonOnlyTag = ` ${season}. série`;
             const seasonTagAlt = ` S${String(season).padStart(2, '0')}`;
+            const s = String(season).padStart(2, '0');
             [base, noDia, short].forEach(b => {
                 queries.add(b + epTag);
                 queries.add((b + epTag).replace(/[\':]/g, ''));
@@ -319,6 +320,8 @@ if (!titles) return { streams: [] };
                 queries.add(noDia + seasonTagAlt);
                 queries.add(`${base} ${season}-`);
                 queries.add(`${noDia} ${season}-`);
+                queries.add(`${base} S${s}-`);
+                queries.add(`${noDia} S${s}-`);
             });
         } else {
             [base, noDia, short].forEach(b => {
