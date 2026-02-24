@@ -225,9 +225,28 @@ async function getInfoHashFromTorrent(url, torrentId) {
         const info = bencode.encode(torrent.info);
         const infoHash = crypto.createHash("sha1").update(info).digest("hex");
 
+// získání trackerů
+let trackers = [];
+
+if (torrent.announce) {
+    trackers.push(torrent.announce.toString());
+}
+
+if (torrent["announce-list"]) {
+    for (const tier of torrent["announce-list"]) {
+        for (const tr of tier) {
+            trackers.push(tr.toString());
+        }
+    }
+}
+
+// odstranění duplicit
+trackers = [...new Set(trackers)];
+
 return {
     infoHash,
-    files: torrent.info.files || []
+    files: torrent.info.files || [],
+    trackers
 };
 
     } catch (err) {
@@ -254,7 +273,7 @@ async function toStream(t, season, episode) {
     const torrentData = await getInfoHashFromTorrent(t.downloadUrl, t.id);
     if (!torrentData) return null;
     
-    const { infoHash, files } = torrentData;
+    const { infoHash, files, trackers } = torrentData;
      
     let fileIdx = 0;
     
@@ -272,9 +291,12 @@ async function toStream(t, season, episode) {
     name: `SKTorrent\n${t.category}`,
     behaviorHints: { bingeGroup: cleanedTitle },
     infoHash,
-    fileIdx
- };
-}
+    fileIdx,
+    sources: [
+        `dht:${infoHash}`,
+        ...trackers.map(tr => `tracker:${tr}`)
+    ]
+};
 
 builder.defineStreamHandler(async ({ type, id }) => {
     console.log(`\n====== 🎮 RAW Požiadavka: type='${type}', id='${id}' ======`);
