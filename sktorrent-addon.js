@@ -298,6 +298,8 @@ async function toStream(t, season, episode) {
     ]
 };
 
+}
+
 builder.defineStreamHandler(async ({ type, id }) => {
     console.log(`\n====== 🎮 RAW Požiadavka: type='${type}', id='${id}' ======`);
 
